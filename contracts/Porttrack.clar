@@ -13,10 +13,19 @@
 (define-constant ERR_INVALID_CLAIM_AMOUNT (err u111))
 (define-constant ERR_PROVIDER_NOT_AUTHORIZED (err u112))
 (define-constant ERR_POLICY_ALREADY_EXISTS (err u113))
+(define-constant ERR_BERTH_NOT_FOUND (err u114))
+(define-constant ERR_BERTH_OCCUPIED (err u115))
+(define-constant ERR_INVALID_CAPACITY (err u116))
+(define-constant ERR_PORT_CONGESTED (err u117))
+(define-constant ERR_INVALID_BERTH_TYPE (err u118))
+(define-constant ERR_RESERVATION_NOT_FOUND (err u119))
+(define-constant ERR_INVALID_TIME_SLOT (err u120))
 
 (define-data-var next-container-id uint u1)
 (define-data-var next-policy-id uint u1)
 (define-data-var next-claim-id uint u1)
+(define-data-var next-berth-id uint u1)
+(define-data-var next-reservation-id uint u1)
 
 (define-map containers
   { container-id: uint }
@@ -117,6 +126,72 @@
 (define-map container-policies
   { container-id: uint }
   { policy-id: uint }
+)
+
+(define-map port-capacity
+  { port: (string-ascii 50) }
+  {
+    max-containers: uint,
+    max-berths: uint,
+    current-utilization: uint,
+    congestion-level: uint,
+    base-fee: uint,
+    congestion-multiplier: uint,
+    last-updated: uint
+  }
+)
+
+(define-map port-berths
+  { berth-id: uint }
+  {
+    port: (string-ascii 50),
+    berth-number: (string-ascii 10),
+    berth-type: (string-ascii 20),
+    max-container-capacity: uint,
+    current-containers: uint,
+    status: (string-ascii 20),
+    hourly-rate: uint,
+    created-at: uint
+  }
+)
+
+(define-map berth-reservations
+  { reservation-id: uint }
+  {
+    berth-id: uint,
+    container-id: uint,
+    reserved-by: principal,
+    start-time: uint,
+    end-time: uint,
+    estimated-duration: uint,
+    actual-start: uint,
+    actual-end: uint,
+    status: (string-ascii 20),
+    total-cost: uint,
+    created-at: uint
+  }
+)
+
+(define-map port-analytics
+  { port: (string-ascii 50) }
+  {
+    total-containers-processed: uint,
+    average-processing-time: uint,
+    total-revenue: uint,
+    efficiency-score: uint,
+    peak-utilization: uint,
+    last-congestion-update: uint
+  }
+)
+
+(define-map congestion-history
+  { port: (string-ascii 50), timestamp: uint }
+  {
+    congestion-level: uint,
+    container-count: uint,
+    berth-utilization: uint,
+    recorded-by: principal
+  }
 )
 
 (define-public (register-container 
@@ -553,3 +628,354 @@
     (* risk-adjusted duration-factor)
   )
 )
+
+(define-public (initialize-port-capacity
+  (port (string-ascii 50))
+  (max-containers uint)
+  (max-berths uint)
+  (base-fee uint)
+  (congestion-multiplier uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (asserts! (is-port-authorized port) ERR_INVALID_PORT)
+    (asserts! (> max-containers u0) ERR_INVALID_CAPACITY)
+    (asserts! (> max-berths u0) ERR_INVALID_CAPACITY)
+    
+    (map-set port-capacity
+      { port: port }
+      {
+        max-containers: max-containers,
+        max-berths: max-berths,
+        current-utilization: u0,
+        congestion-level: u0,
+        base-fee: base-fee,
+        congestion-multiplier: congestion-multiplier,
+        last-updated: stacks-block-height
+      }
+    )
+    
+    (map-set port-analytics
+      { port: port }
+      {
+        total-containers-processed: u0,
+        average-processing-time: u0,
+        total-revenue: u0,
+        efficiency-score: u100,
+        peak-utilization: u0,
+        last-congestion-update: stacks-block-height
+      }
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (create-berth
+  (port (string-ascii 50))
+  (berth-number (string-ascii 10))
+  (berth-type (string-ascii 20))
+  (max-container-capacity uint)
+  (hourly-rate uint))
+  (let ((berth-id (var-get next-berth-id)))
+    (asserts! (is-authorized-operator tx-sender) ERR_UNAUTHORIZED)
+    (asserts! (is-port-authorized port) ERR_INVALID_PORT)
+    (asserts! (> max-container-capacity u0) ERR_INVALID_CAPACITY)
+    (asserts! (is-valid-berth-type berth-type) ERR_INVALID_BERTH_TYPE)
+    
+    (map-set port-berths
+      { berth-id: berth-id }
+      {
+        port: port,
+        berth-number: berth-number,
+        berth-type: berth-type,
+        max-container-capacity: max-container-capacity,
+        current-containers: u0,
+        status: "available",
+        hourly-rate: hourly-rate,
+        created-at: stacks-block-height
+      }
+    )
+    
+    (var-set next-berth-id (+ berth-id u1))
+    (ok berth-id)
+  )
+)
+
+(define-public (reserve-berth
+  (berth-id uint)
+  (container-id uint)
+  (estimated-duration uint))
+  (let (
+    (reservation-id (var-get next-reservation-id))
+    (berth (unwrap! (map-get? port-berths { berth-id: berth-id }) ERR_BERTH_NOT_FOUND))
+    (container (unwrap! (map-get? containers { container-id: container-id }) ERR_CONTAINER_NOT_FOUND))
+    (port-cap (unwrap! (map-get? port-capacity { port: (get port berth) }) ERR_INVALID_PORT))
+    (current-utilization (calculate-port-utilization (get port berth)))
+  )
+    (asserts! (is-authorized-operator tx-sender) ERR_UNAUTHORIZED)
+    (asserts! (is-eq (get status berth) "available") ERR_BERTH_OCCUPIED)
+    (asserts! (> estimated-duration u0) ERR_INVALID_TIME_SLOT)
+    (asserts! (< current-utilization (get max-containers port-cap)) ERR_PORT_CONGESTED)
+    
+    (let ((total-cost (calculate-berth-cost berth-id estimated-duration (get port berth))))
+      (map-set berth-reservations
+        { reservation-id: reservation-id }
+        {
+          berth-id: berth-id,
+          container-id: container-id,
+          reserved-by: tx-sender,
+          start-time: stacks-block-height,
+          end-time: (+ stacks-block-height estimated-duration),
+          estimated-duration: estimated-duration,
+          actual-start: u0,
+          actual-end: u0,
+          status: "reserved",
+          total-cost: total-cost,
+          created-at: stacks-block-height
+        }
+      )
+      
+      (map-set port-berths
+        { berth-id: berth-id }
+        (merge berth { status: "reserved" })
+      )
+      
+      (update-port-congestion (get port berth))
+      (var-set next-reservation-id (+ reservation-id u1))
+      (ok reservation-id)
+    )
+  )
+)
+
+(define-public (start-berth-operation (reservation-id uint))
+  (let (
+    (reservation (unwrap! (map-get? berth-reservations { reservation-id: reservation-id }) ERR_RESERVATION_NOT_FOUND))
+    (berth (unwrap! (map-get? port-berths { berth-id: (get berth-id reservation) }) ERR_BERTH_NOT_FOUND))
+  )
+    (asserts! (is-authorized-operator tx-sender) ERR_UNAUTHORIZED)
+    (asserts! (is-eq (get status reservation) "reserved") ERR_BERTH_OCCUPIED)
+    
+    (map-set berth-reservations
+      { reservation-id: reservation-id }
+      (merge reservation {
+        actual-start: stacks-block-height,
+        status: "active"
+      })
+    )
+    
+    (map-set port-berths
+      { berth-id: (get berth-id reservation) }
+      (merge berth {
+        status: "occupied",
+        current-containers: (+ (get current-containers berth) u1)
+      })
+    )
+    
+    (update-port-congestion (get port berth))
+    (ok true)
+  )
+)
+
+(define-public (complete-berth-operation (reservation-id uint))
+  (let (
+    (reservation (unwrap! (map-get? berth-reservations { reservation-id: reservation-id }) ERR_RESERVATION_NOT_FOUND))
+    (berth (unwrap! (map-get? port-berths { berth-id: (get berth-id reservation) }) ERR_BERTH_NOT_FOUND))
+    (port (get port berth))
+    (processing-time (- stacks-block-height (get actual-start reservation)))
+  )
+    (asserts! (is-authorized-operator tx-sender) ERR_UNAUTHORIZED)
+    (asserts! (is-eq (get status reservation) "active") ERR_INVALID_TIME_SLOT)
+    
+    (map-set berth-reservations
+      { reservation-id: reservation-id }
+      (merge reservation {
+        actual-end: stacks-block-height,
+        status: "completed"
+      })
+    )
+    
+    (map-set port-berths
+      { berth-id: (get berth-id reservation) }
+      (merge berth {
+        status: "available",
+        current-containers: (if (> (get current-containers berth) u0) 
+          (- (get current-containers berth) u1) 
+          u0)
+      })
+    )
+    
+    (update-port-analytics port processing-time (get total-cost reservation))
+    (update-port-congestion port)
+    (ok true)
+  )
+)
+
+(define-public (update-congestion-level
+  (port (string-ascii 50))
+  (new-level uint))
+  (let ((port-cap (unwrap! (map-get? port-capacity { port: port }) ERR_INVALID_PORT)))
+    (asserts! (is-authorized-operator tx-sender) ERR_UNAUTHORIZED)
+    (asserts! (<= new-level u100) ERR_INVALID_CAPACITY)
+    
+    (map-set port-capacity
+      { port: port }
+      (merge port-cap {
+        congestion-level: new-level,
+        last-updated: stacks-block-height
+      })
+    )
+    
+    (map-set congestion-history
+      { port: port, timestamp: stacks-block-height }
+      {
+        congestion-level: new-level,
+        container-count: (get-port-container-count port),
+        berth-utilization: (calculate-berth-utilization port),
+        recorded-by: tx-sender
+      }
+    )
+    
+    (ok true)
+  )
+)
+
+(define-read-only (get-port-capacity (port (string-ascii 50)))
+  (map-get? port-capacity { port: port })
+)
+
+(define-read-only (get-berth-info (berth-id uint))
+  (map-get? port-berths { berth-id: berth-id })
+)
+
+(define-read-only (get-berth-reservation (reservation-id uint))
+  (map-get? berth-reservations { reservation-id: reservation-id })
+)
+
+(define-read-only (get-port-analytics (port (string-ascii 50)))
+  (map-get? port-analytics { port: port })
+)
+
+(define-read-only (get-congestion-history (port (string-ascii 50)) (timestamp uint))
+  (map-get? congestion-history { port: port, timestamp: timestamp })
+)
+
+(define-read-only (calculate-berth-cost (berth-id uint) (duration uint) (port (string-ascii 50)))
+  (let (
+    (berth (unwrap! (map-get? port-berths { berth-id: berth-id }) u0))
+    (port-cap (unwrap! (map-get? port-capacity { port: port }) u0))
+    (base-cost (* (get hourly-rate berth) duration))
+    (congestion-fee (/ (* base-cost (get congestion-level port-cap) (get congestion-multiplier port-cap)) u10000))
+  )
+    (+ base-cost congestion-fee)
+  )
+)
+
+(define-read-only (get-next-berth-id)
+  (var-get next-berth-id)
+)
+
+(define-read-only (get-next-reservation-id)
+  (var-get next-reservation-id)
+)
+
+(define-private (calculate-port-utilization (port (string-ascii 50)))
+  (default-to u0 (get container-count (map-get? port-containers { port: port })))
+)
+
+(define-private (calculate-berth-utilization (port (string-ascii 50)))
+  (let (
+    (port-cap (unwrap! (map-get? port-capacity { port: port }) u0))
+    (occupied-berths (count-occupied-berths port))
+  )
+    (if (> (get max-berths port-cap) u0)
+      (/ (* occupied-berths u100) (get max-berths port-cap))
+      u0
+    )
+  )
+)
+
+(define-private (count-occupied-berths (port (string-ascii 50)))
+  u1
+)
+
+(define-private (update-port-congestion (port (string-ascii 50)))
+  (let (
+    (current-containers (calculate-port-utilization port))
+    (port-cap (unwrap! (map-get? port-capacity { port: port }) false))
+    (utilization-percentage (if (> (get max-containers port-cap) u0)
+      (/ (* current-containers u100) (get max-containers port-cap))
+      u0))
+    (new-congestion-level (calculate-congestion-level utilization-percentage))
+  )
+    (map-set port-capacity
+      { port: port }
+      (merge port-cap {
+        current-utilization: current-containers,
+        congestion-level: new-congestion-level,
+        last-updated: stacks-block-height
+      })
+    )
+  )
+)
+
+(define-private (update-port-analytics (port (string-ascii 50)) (processing-time uint) (revenue uint))
+  (let ((analytics (default-to 
+    { total-containers-processed: u0, average-processing-time: u0, total-revenue: u0, efficiency-score: u100, peak-utilization: u0, last-congestion-update: u0 }
+    (map-get? port-analytics { port: port }))))
+    (map-set port-analytics
+      { port: port }
+      (merge analytics {
+        total-containers-processed: (+ (get total-containers-processed analytics) u1),
+        average-processing-time: (/ (+ (* (get average-processing-time analytics) (get total-containers-processed analytics)) processing-time)
+          (+ (get total-containers-processed analytics) u1)),
+        total-revenue: (+ (get total-revenue analytics) revenue),
+        efficiency-score: (calculate-efficiency-score processing-time),
+        last-congestion-update: stacks-block-height
+      })
+    )
+  )
+)
+
+(define-private (calculate-congestion-level (utilization-percentage uint))
+  (if (<= utilization-percentage u50)
+    u0
+    (if (<= utilization-percentage u75)
+      u25
+      (if (<= utilization-percentage u90)
+        u50
+        u100
+      )
+    )
+  )
+)
+
+(define-private (calculate-efficiency-score (processing-time uint))
+  (let (
+    (base-time u24)
+    (penalty (* (- processing-time base-time) u5))
+    (score (if (> penalty u90) u10 (- u100 penalty)))
+  )
+    (if (<= processing-time base-time)
+      u100
+      score
+    )
+  )
+)
+
+(define-private (is-valid-berth-type (berth-type (string-ascii 20)))
+  (or
+    (is-eq berth-type "container")
+    (or
+      (is-eq berth-type "bulk")
+      (or
+        (is-eq berth-type "tanker")
+        (or
+          (is-eq berth-type "general")
+          (is-eq berth-type "ro-ro")
+        )
+      )
+    )
+  )
+)
+
+
